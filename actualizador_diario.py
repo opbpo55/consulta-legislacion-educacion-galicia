@@ -21,6 +21,7 @@ Flujo:
 
 from __future__ import annotations
 
+import base64
 import email.message
 import gzip
 import hashlib
@@ -46,6 +47,9 @@ BASE_DIR = Path(__file__).resolve().parent
 DB_DIR = BASE_DIR / "base_datos"
 TMP_DIR = Path(os.environ.get("RUNNER_TEMP", "/tmp" if os.name != "nt" else str(BASE_DIR / ".tmp_update")))
 RECIPIENT_EMAIL = os.environ.get("NOTIFY_EMAIL", "oscar.perez.instituto@gmail.com")
+TARGET_SUBFOLDER = "08_Resolucions_Instrucions_Anuncios"
+MAX_NEW_PER_RUN = 25
+_DRIVE_WEBHOOK_UNCONFIGURED_LOGGED = False
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ActualizadorLegislativoGalicia/2.0 (Educacion)",
@@ -200,12 +204,12 @@ def download_and_extract_pdf(session: requests.Session, pdf_url: str, title: str
         if not r.content.startswith(b"%PDF"):
             return None
 
-        clean_slug = re.sub(r"[^a-zA-Z0-9_\-]+", "_", title)[:60].strip("_")
-        file_name = f"{datetime.now().strftime('%Y%m%d')}_{clean_slug}.pdf"
+        sha256_hash = hashlib.sha256(r.content).hexdigest()
+        clean_slug = re.sub(r"[^a-zA-Z0-9_\-]+", "_", title)[:60].strip("_") or "resolucion"
+        file_name = f"{datetime.now().strftime('%Y%m%d')}_{clean_slug}_{sha256_hash[:8]}.pdf"
 
         saved_path = TMP_DIR / file_name
         saved_path.write_bytes(r.content)
-        sha256_hash = hashlib.sha256(r.content).hexdigest()
 
         # Extraer páginas
         reader = pypdf.PdfReader(str(saved_path))
@@ -229,12 +233,13 @@ def download_and_extract_pdf(session: requests.Session, pdf_url: str, title: str
 
 def index_new_document(conn: sqlite3.Connection, cand: dict, pdf_data: dict) -> str:
     """Inserta el nuevo documento y sus páginas en la base SQLite compactada."""
-    import hashlib
-    import json
-    import uuid
-
     c = conn.cursor()
-    doc_hash = hashlib.sha256(pdf_data["file_name"].encode("utf-8")).hexdigest()[:12]
+    raw_b = pdf_data.get("raw_bytes") or b""
+    doc_hash = (
+        hashlib.sha256(raw_b).hexdigest()[:12]
+        if raw_b
+        else hashlib.sha256(pdf_data["file_name"].encode("utf-8")).hexdigest()[:12]
+    )
     next_id = f"doc_{doc_hash}"
 
     today_str = datetime.now().strftime("%Y-%m-%d")
@@ -242,7 +247,6 @@ def index_new_document(conn: sqlite3.Connection, cand: dict, pdf_data: dict) -> 
     ambito = cand.get("ambito", "Autonómico")
     etapa = cand.get("etapa", "Transversal")
     total_chars = sum(len(p["text"]) for p in pdf_data["pages"])
-    raw_b = pdf_data.get("raw_bytes") or b""
     file_bytes = len(raw_b)
     sha256 = hashlib.sha256(raw_b).hexdigest()
     selectable_pages = sum(1 for p in pdf_data["pages"] if len(p["text"]) > 20)
@@ -263,8 +267,8 @@ def index_new_document(conn: sqlite3.Connection, cand: dict, pdf_data: dict) -> 
             title,
             pdf_data["file_name"],
             pdf_data["file_name"],
-            f"08_avisos/{pdf_data['file_name']}",
-            "08_avisos",
+            f"{TARGET_SUBFOLDER}/{pdf_data['file_name']}",
+            TARGET_SUBFOLDER,
             cand.get("origen", "Portal Educativo"),
             json.dumps([cand.get("origen", "Portal Educativo")]),
             cand["source_url"],
@@ -340,6 +344,105 @@ def save_and_rechunk_database(db_path: Path):
             print(f"[Export] Generado {part_path.name}: {len(data)/1024/1024:.2f} MB")
 
 
+def upload_pdf_to_drive_webhook(
+    pdf_data: dict,
+    subfolder: str = TARGET_SUBFOLDER,
+    drive_map_path: Path | None = None,
+) -> dict | None:
+    """Sube un PDF nuevo a Google Drive llamando al Web App de Apps Script."""
+    global _DRIVE_WEBHOOK_UNCONFIGURED_LOGGED
+    webhook_url = os.environ.get("DRIVE_WEBHOOK_URL", "").strip()
+    webhook_token = os.environ.get("DRIVE_WEBHOOK_TOKEN", "").strip()
+
+    if not webhook_url or not webhook_token:
+        if not _DRIVE_WEBHOOK_UNCONFIGURED_LOGGED:
+            print("[Drive] AVISO: DRIVE_WEBHOOK_URL o DRIVE_WEBHOOK_TOKEN no configurados; se omite subida a Drive.")
+            _DRIVE_WEBHOOK_UNCONFIGURED_LOGGED = True
+        return None
+
+    raw_bytes = pdf_data.get("raw_bytes") or b""
+    if not raw_bytes and pdf_data.get("file_path") and Path(pdf_data["file_path"]).is_file():
+        raw_bytes = Path(pdf_data["file_path"]).read_bytes()
+
+    if not raw_bytes:
+        print(f"[Drive] AVISO: Sin bytes válidos para subir {pdf_data.get('file_name', '')}.")
+        return None
+
+    max_bytes = 35 * 1024 * 1024
+    if len(raw_bytes) > max_bytes:
+        print(f"[Drive] AVISO: '{pdf_data.get('file_name')}' supera 35 MB ({len(raw_bytes)/1024/1024:.1f} MB); se omite subida vía Apps Script.")
+        return None
+
+    payload = {
+        "token": webhook_token,
+        "file_name": pdf_data["file_name"],
+        "subfolder": subfolder,
+        "pdf_base64": base64.b64encode(raw_bytes).decode("ascii"),
+    }
+
+    try:
+        r = requests.post(webhook_url, json=payload, timeout=90, allow_redirects=True)
+        if r.status_code != 200:
+            print(f"[Drive] Error HTTP {r.status_code} subiendo {pdf_data['file_name']} a Drive.")
+            return None
+        try:
+            data = r.json()
+        except Exception:
+            print(f"[Drive] Respuesta no JSON del webhook de Drive ({r.text[:200]!r}).")
+            return None
+
+        if data.get("ok") is True and data.get("file_id"):
+            print(f"[Drive] Subido a Google Drive: {pdf_data['file_name']} (ID: {data['file_id']})")
+            return data
+
+        print(f"[Drive] Error devuelto por Apps Script para {pdf_data['file_name']}: {data.get('error', data)}")
+        return None
+    except Exception as exc:
+        print(f"[Drive] Excepción subiendo {pdf_data.get('file_name')} a Drive: {exc}")
+        return None
+
+
+def update_local_drive_map(
+    relative_path: str,
+    file_name: str,
+    file_id: str,
+    map_path: Path | None = None,
+) -> bool:
+    """Actualiza de forma atómica el drive_map.json del repositorio conservando las entradas previas."""
+    target = map_path or (BASE_DIR / "drive_map.json")
+    try:
+        if target.is_file():
+            payload = json.loads(target.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                payload = {}
+        else:
+            payload = {}
+
+        by_rel = payload.get("by_relative_path")
+        if not isinstance(by_rel, dict):
+            by_rel = {}
+        by_name = payload.get("by_file_name")
+        if not isinstance(by_name, dict):
+            by_name = {}
+
+        rel_norm = relative_path.replace("\\", "/").lstrip("/")
+        by_rel[rel_norm] = file_id
+        by_name[file_name] = file_id
+
+        payload["by_relative_path"] = by_rel
+        payload["by_file_name"] = by_name
+        payload["total_files"] = len(by_rel)
+        payload["generated_at"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        tmp_target = target.with_suffix(".json.tmp")
+        tmp_target.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        tmp_target.replace(target)
+        return True
+    except Exception as exc:
+        print(f"[Drive] Error actualizando {target.name}: {exc}")
+        return False
+
+
 def send_notification_email(updated_docs: list[dict], sources_checked: list[str]):
     """Envía un correo electrónico con los resultados de la comprobación."""
     smtp_user = os.environ.get("GMAIL_USER", RECIPIENT_EMAIL)
@@ -375,14 +478,27 @@ def send_notification_email(updated_docs: list[dict], sources_checked: list[str]
     else:
         msg["Subject"] = f"🚨 Nueva Normativa Educativa Galicia: {len(updated_docs)} archivo(s) nuevo(s)"
         doc_items_html = ""
+        synced_drive_count = sum(1 for d in updated_docs if d.get("drive_url"))
         for d in updated_docs:
+            drive_link_html = ""
+            if d.get("drive_url"):
+                drive_link_html = f' · <a href="{d["drive_url"]}" style="color: #2f855a; font-weight: 600;">Abrir en Google Drive</a>'
             doc_items_html += f"""
             <li style="margin-bottom: 12px;">
                 <strong>{d['title']}</strong><br>
                 <span>Páxinas: {d['page_count']} | Ámbito: {d.get('ambito', 'Galicia')}</span><br>
-                <a href="{d['source_url']}" style="color: #3182ce;">Ver orixe oficial</a>
+                <a href="{d['source_url']}" style="color: #3182ce;">Ver orixe oficial</a>{drive_link_html}
             </li>
             """
+
+        if synced_drive_count == len(updated_docs):
+            drive_status_msg = f"Sincronización con Google Drive: gardáronse os {synced_drive_count} PDFs na túa carpeta <code>corpus_pdf/{TARGET_SUBFOLDER}</code>."
+        elif synced_drive_count > 0:
+            drive_status_msg = f"Sincronización con Google Drive: gardáronse {synced_drive_count} de {len(updated_docs)} PDFs na túa carpeta."
+        elif os.environ.get("DRIVE_WEBHOOK_URL", "").strip():
+            drive_status_msg = "Sincronización con Google Drive: non se puideron subir os ficheiros nesta execución (revisar rexistro)."
+        else:
+            drive_status_msg = "Sincronización automática de subida a Google Drive aínda non configurada (DRIVE_WEBHOOK_URL pendente)."
 
         body = f"""
         <html>
@@ -396,7 +512,7 @@ def send_notification_email(updated_docs: list[dict], sources_checked: list[str]
                         {doc_items_html}
                     </ul>
                 </div>
-                <p><strong>Actualización automática:</strong> A base de datos foi actualizada e despregada en Render. O asistente de IA xa pode responder citando estas páxinas.</p>
+                <p><strong>Actualización automática:</strong> A base de datos foi actualizada e despregada en Render. {drive_status_msg}</p>
                 <p><em>Adxúntanse nesta mensaxe os ficheiros PDF descargados para o teu arquivo persoal.</em></p>
             </div>
         </body>
@@ -459,6 +575,10 @@ def main():
     print(f"[Crawler] Evaluando {len(candidates)} publicacións recentes atopadas...")
     new_docs = []
     for cand in candidates:
+        if len(new_docs) >= MAX_NEW_PER_RUN:
+            print(f"[Crawler] Alcanzado límite de {MAX_NEW_PER_RUN} documentos novos nesta execución.")
+            break
+
         src_url = cand["source_url"].strip().lower()
         if src_url in existing_urls:
             continue
@@ -481,13 +601,25 @@ def main():
         existing_files.add(pdf_data["file_name"].lower())
         existing_hashes.add(pdf_data["sha256"].lower())
 
+        # Subir a Google Drive mediante Web App de Apps Script (se está configurado)
+        drive_res = upload_pdf_to_drive_webhook(pdf_data, TARGET_SUBFOLDER)
+        drive_url = ""
+        drive_fid = ""
+        if drive_res and drive_res.get("file_id"):
+            drive_fid = str(drive_res["file_id"])
+            drive_url = str(drive_res.get("view_url") or f"https://drive.google.com/file/d/{drive_fid}/view")
+            rel_path = f"{TARGET_SUBFOLDER}/{pdf_data['file_name']}"
+            update_local_drive_map(rel_path, pdf_data["file_name"], drive_fid)
+
         new_docs.append({
             "id": doc_id,
             "title": cand["title"],
             "page_count": pdf_data["page_count"],
             "source_url": cand["source_url"],
             "ambito": cand.get("ambito", "Autonómico"),
-            "file_path": pdf_data["file_path"]
+            "file_path": pdf_data["file_path"],
+            "drive_url": drive_url,
+            "drive_file_id": drive_fid,
         })
 
     conn.close()
