@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: legislacion-galicia
+    runtime: docker
+    plan: free
+    region: frankfurt # o oregon
+    envVars:
+      - key: PUBLIC_MODE
+        value: "1"
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: DRIVE_MAP_FILE_ID
+        sync: false
+      - key: ACCESS_PIN
+        sync: false

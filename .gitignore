@@ -1,0 +1,10 @@
+gemini_config.json
+__pycache__/
+*.pyc
+*.db
+*.db-shm
+*.db-wal
+*.tmp
+/tmp/
+# Ignorar el archivo grande individual >100MB; se usan los fragmentos db_chunk_*.bin <75MB
+legislacion_galicia_web.db.gz
