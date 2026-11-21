@@ -6,5 +6,7 @@ __pycache__/
 *.db-wal
 *.tmp
 /tmp/
+.tmp_update/
+*.bin.marker
 # Ignorar el archivo grande individual >100MB; se usan los fragmentos db_chunk_*.bin <75MB
 legislacion_galicia_web.db.gz

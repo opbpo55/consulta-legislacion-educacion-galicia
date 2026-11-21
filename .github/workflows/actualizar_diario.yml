@@ -1,0 +1,52 @@
+name: Comprobación e Actualización Diaria de Lexislación
+
+on:
+  schedule:
+    # Execútase todos os días ás 06:00 UTC (07:00 / 08:00 hora peninsular española)
+    - cron: '0 6 * * *'
+  # Permite execución manual cun botón desde GitHub ("Run workflow")
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  actualizar:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Instalar dependencias necesarias
+        run: |
+          pip install --upgrade pip
+          pip install requests beautifulsoup4 pypdf
+
+      - name: Executar rastrexo, indexación e envío de correo
+        env:
+          GMAIL_USER: "oscar.perez.instituto@gmail.com"
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          NOTIFY_EMAIL: "oscar.perez.instituto@gmail.com"
+        run: |
+          python actualizador_diario.py
+
+      - name: Gardar e despregar cambios se houbo novos documentos
+        run: |
+          if [[ -n $(git status -s base_datos) ]]; then
+            echo "Detectáronse novos fragmentos da base de datos. Facendo commit..."
+            git config --global user.name "github-actions[bot]"
+            git config --global user.email "github-actions[bot]@users.noreply.github.com"
+            git add base_datos/
+            git commit -m "Actualización automática lexislación [$(date +'%Y-%m-%d')]"
+            git push
+            echo "Push completado. Render actualizará o servizo web automaticamente."
+          else
+            echo "Sen cambios na base de datos. Ningún commit necesario."
+          fi
