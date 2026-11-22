@@ -1,6 +1,6 @@
 /**
  * Google Apps Script para conectar tu carpeta "Antigravity ID Legislación" de Google Drive
- * con el buscador en Render (lectura) y con el actualizador diario de GitHub Actions (escritura).
+ * con el buscador en Render (lectura) y con el actualizador diario de GitHub Actions (escritura y archivo histórico).
  *
  * CÓMO USARLO:
  * A) Indexar mapa inicial / regenerar mapa manual:
@@ -9,10 +9,10 @@
  *    3. Pega TODO este archivo, guarda y ejecuta la función `generarMapaDrive`.
  *    4. Acepta los permisos de Google Drive la primera vez.
  *
- * B) Activar subida automática diaria desde GitHub Actions (Webhook):
+ * B) Activar subida y archivo histórico automático desde GitHub Actions (Webhook):
  *    1. Cambia WEBHOOK_SECRET_TOKEN abajo por una clave secreta inventada por ti
  *       (o guárdala en Configuración del proyecto -> Propiedades del script -> WEBHOOK_TOKEN).
- *    2. Guarda y pulsa "Implementar" -> "Nueva implementación".
+ *    2. Guarda y pulsa "Implementar" -> "Nueva implementación" (o "Gestionar implementaciones" -> "Nueva versión").
  *    3. Tipo: "Aplicación web" | Ejecutar como: "Yo" | Quién tiene acceso: "Cualquier persona".
  *    4. Copia la URL de la aplicación web y guárdala en GitHub Secrets como `DRIVE_WEBHOOK_URL`,
  *       junto con tu clave secreta como `DRIVE_WEBHOOK_TOKEN`.
@@ -25,6 +25,7 @@ const COMPARTIR_SOLO_LECTURA_CON_ENLACE = true;
 // Cambia este valor por una contraseña secreta larga y privada (NO la subas a GitHub).
 const WEBHOOK_SECRET_TOKEN = "CAMBIAR_POR_TU_CLAVE_SECRETA";
 const DEFAULT_UPLOAD_SUBFOLDER = "08_Resolucions_Instrucions_Anuncios";
+const HISTORICO_SUBFOLDER = "99_Historico_Derogadas";
 
 function _getExpectedToken() {
   try {
@@ -48,10 +49,124 @@ function _jsonResponse(obj) {
     .setMimeType(ContentService.MimeType.JSON);
 }
 
+function _sanitizeName(rawName, forcePdfSuffix) {
+  let clean = String(rawName || "")
+    .replace(/\.\./g, "")
+    .replace(/[\/\\:*?"<>|\x00-\x1f]/g, "_")
+    .trim();
+  if (!clean) {
+    return "";
+  }
+  if (forcePdfSuffix && !clean.toLowerCase().endsWith(".pdf")) {
+    clean += ".pdf";
+  }
+  return clean;
+}
+
+function _sanitizeSubfolder(rawSub, fallbackSub) {
+  const clean = String(rawSub || "")
+    .replace(/\.\./g, "")
+    .replace(/[\/\\:*?"<>|\x00-\x1f]/g, "")
+    .trim();
+  return clean || fallbackSub;
+}
+
+function _getOrCreateSubfolder(corpusFolder, subfolderName) {
+  const iter = corpusFolder.getFoldersByName(subfolderName);
+  return iter.hasNext() ? iter.next() : corpusFolder.createFolder(subfolderName);
+}
+
+function _loadOrInitDriveMap(rootFolder, corpusFolder) {
+  let mapPayload = {
+    generated_at: new Date().toISOString(),
+    root_folder_id: rootFolder.getId(),
+    corpus_folder_id: corpusFolder.getId(),
+    total_files: 0,
+    by_relative_path: {},
+    by_file_name: {}
+  };
+  let mapFile = null;
+  const existingMap = rootFolder.getFilesByName("drive_map.json");
+  if (existingMap.hasNext()) {
+    mapFile = existingMap.next();
+    try {
+      const parsed = JSON.parse(mapFile.getBlob().getDataAsString("UTF-8"));
+      if (parsed && typeof parsed === "object") {
+        mapPayload = parsed;
+      }
+    } catch (err) {
+      Logger.log("Aviso leyendo drive_map.json previo: " + err.message);
+    }
+  }
+  if (!mapPayload.by_relative_path || typeof mapPayload.by_relative_path !== "object") {
+    mapPayload.by_relative_path = {};
+  }
+  if (!mapPayload.by_file_name || typeof mapPayload.by_file_name !== "object") {
+    mapPayload.by_file_name = {};
+  }
+  return { mapFile: mapFile, mapPayload: mapPayload };
+}
+
+function _saveDriveMap(rootFolder, mapState) {
+  const jsonText = JSON.stringify(mapState.mapPayload);
+  if (mapState.mapFile) {
+    mapState.mapFile.setContent(jsonText);
+    return mapState.mapFile;
+  }
+  const newFile = rootFolder.createFile("drive_map.json", jsonText, MimeType.PLAIN_TEXT);
+  if (COMPARTIR_SOLO_LECTURA_CON_ENLACE) {
+    try {
+      newFile.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+    } catch (err) {
+      Logger.log("Aviso compartiendo drive_map.json: " + err.message);
+    }
+  }
+  return newFile;
+}
+
+function _findPdfInCorpus(corpusFolder, preferredFolderName, fileName, fileId) {
+  if (fileId) {
+    try {
+      const byId = DriveApp.getFileById(String(fileId).trim());
+      if (byId && !byId.isTrashed()) {
+        return byId;
+      }
+    } catch (err) {
+      Logger.log("Aviso buscando por file_id (" + fileId + "): " + err.message);
+    }
+  }
+  if (preferredFolderName) {
+    const pIter = corpusFolder.getFoldersByName(preferredFolderName);
+    if (pIter.hasNext()) {
+      const pf = pIter.next().getFilesByName(fileName);
+      if (pf.hasNext()) {
+        return pf.next();
+      }
+    }
+  }
+  const catIter = corpusFolder.getFolders();
+  while (catIter.hasNext()) {
+    const cat = catIter.next();
+    if (cat.getName() === HISTORICO_SUBFOLDER) {
+      continue;
+    }
+    const fIter = cat.getFilesByName(fileName);
+    if (fIter.hasNext()) {
+      return fIter.next();
+    }
+  }
+  const rootIter = corpusFolder.getFilesByName(fileName);
+  if (rootIter.hasNext()) {
+    return rootIter.next();
+  }
+  return null;
+}
+
 function doGet(e) {
   return _jsonResponse({
     ok: true,
     service: "Antigravity Drive Uploader",
+    actions: ["upload", "archive"],
     token_configured: Boolean(_getExpectedToken())
   });
 }
@@ -75,38 +190,10 @@ function doPost(e) {
       return _jsonResponse({ ok: false, error: "unauthorized" });
     }
 
-    // Sanitizar nombre de archivo
-    let rawName = payload.file_name ? String(payload.file_name) : "";
-    let safeFileName = rawName
-      .replace(/\.\./g, "")
-      .replace(/[\/\\:*?"<>|\x00-\x1f]/g, "_")
-      .trim();
-    if (!safeFileName) {
-      return _jsonResponse({ ok: false, error: "missing_file_name" });
-    }
-    if (!safeFileName.toLowerCase().endsWith(".pdf")) {
-      safeFileName += ".pdf";
-    }
-
-    // Sanitizar subcarpeta destino
-    let rawSub = payload.subfolder ? String(payload.subfolder) : DEFAULT_UPLOAD_SUBFOLDER;
-    let subfolder = rawSub
-      .replace(/\.\./g, "")
-      .replace(/[\/\\:*?"<>|\x00-\x1f]/g, "")
-      .trim();
-    if (!subfolder) {
-      subfolder = DEFAULT_UPLOAD_SUBFOLDER;
-    }
-
-    const pdfBase64 = payload.pdf_base64 ? String(payload.pdf_base64).trim() : "";
-    if (!pdfBase64) {
-      return _jsonResponse({ ok: false, error: "missing_pdf_base64" });
-    }
-
     const rootName = "Antigravity ID Legislación";
     const rootIter = DriveApp.getFoldersByName(rootName);
     if (!rootIter.hasNext()) {
-      return _jsonResponse({ ok: false, error: 'root_folder_not_found: ' + rootName });
+      return _jsonResponse({ ok: false, error: "root_folder_not_found: " + rootName });
     }
     const rootFolder = rootIter.next();
 
@@ -116,11 +203,68 @@ function doPost(e) {
     }
     const corpusFolder = subIter.next();
 
-    const targetIter = corpusFolder.getFoldersByName(subfolder);
-    const targetFolder = targetIter.hasNext()
-      ? targetIter.next()
-      : corpusFolder.createFolder(subfolder);
+    const action = payload.action ? String(payload.action).trim().toLowerCase() : "upload";
 
+    if (action === "archive") {
+      const oldRel = payload.relative_path ? String(payload.relative_path).replace(/\\/g, "/").trim() : "";
+      const relParts = oldRel ? oldRel.split("/") : [];
+      const oldFolderHint = relParts.length > 1 ? _sanitizeSubfolder(relParts[0], "") : "";
+      const rawName = payload.file_name || (relParts.length ? relParts[relParts.length - 1] : "");
+      const safeFileName = _sanitizeName(rawName, false);
+      if (!safeFileName && !payload.file_id) {
+        return _jsonResponse({ ok: false, error: "missing_file_identifier" });
+      }
+
+      const targetSub = _sanitizeSubfolder(payload.target_subfolder, HISTORICO_SUBFOLDER);
+      const targetFolder = _getOrCreateSubfolder(corpusFolder, targetSub);
+      const file = _findPdfInCorpus(corpusFolder, oldFolderHint, safeFileName, payload.file_id);
+      if (!file) {
+        return _jsonResponse({ ok: false, error: "file_not_found" });
+      }
+
+      const fid = file.getId();
+      const actualName = file.getName();
+      file.moveTo(targetFolder);
+
+      const mapState = _loadOrInitDriveMap(rootFolder, corpusFolder);
+      const newRel = targetSub + "/" + actualName;
+      if (oldRel && oldRel !== newRel) {
+        delete mapState.mapPayload.by_relative_path[oldRel];
+      }
+      const existingKeys = Object.keys(mapState.mapPayload.by_relative_path);
+      for (let i = 0; i < existingKeys.length; i++) {
+        const k = existingKeys[i];
+        if (k !== newRel && mapState.mapPayload.by_relative_path[k] === fid) {
+          delete mapState.mapPayload.by_relative_path[k];
+        }
+      }
+      mapState.mapPayload.by_relative_path[newRel] = fid;
+      mapState.mapPayload.by_file_name[actualName] = fid;
+      mapState.mapPayload.total_files = Object.keys(mapState.mapPayload.by_relative_path).length;
+      mapState.mapPayload.generated_at = new Date().toISOString();
+      _saveDriveMap(rootFolder, mapState);
+
+      return _jsonResponse({
+        ok: true,
+        action: "archive",
+        moved: true,
+        file_id: fid,
+        new_relative_path: newRel
+      });
+    }
+
+    const safeFileName = _sanitizeName(payload.file_name, true);
+    if (!safeFileName) {
+      return _jsonResponse({ ok: false, error: "missing_file_name" });
+    }
+
+    const subfolder = _sanitizeSubfolder(payload.subfolder, DEFAULT_UPLOAD_SUBFOLDER);
+    const pdfBase64 = payload.pdf_base64 ? String(payload.pdf_base64).trim() : "";
+    if (!pdfBase64) {
+      return _jsonResponse({ ok: false, error: "missing_pdf_base64" });
+    }
+
+    const targetFolder = _getOrCreateSubfolder(corpusFolder, subfolder);
     let file;
     const existingFiles = targetFolder.getFilesByName(safeFileName);
     if (existingFiles.hasNext()) {
@@ -142,62 +286,20 @@ function doPost(e) {
     const fid = file.getId();
     const rel = subfolder + "/" + safeFileName;
 
-    // Actualizar drive_map.json incrementalmente
-    let mapPayload = {
-      generated_at: new Date().toISOString(),
-      root_folder_id: rootFolder.getId(),
-      corpus_folder_id: corpusFolder.getId(),
-      total_files: 0,
-      by_relative_path: {},
-      by_file_name: {}
-    };
-
-    const existingMap = rootFolder.getFilesByName("drive_map.json");
-    let mapFile = null;
-    if (existingMap.hasNext()) {
-      mapFile = existingMap.next();
-      try {
-        const parsedMap = JSON.parse(mapFile.getBlob().getDataAsString("UTF-8"));
-        if (parsedMap && typeof parsedMap === "object") {
-          mapPayload = parsedMap;
-        }
-      } catch (err) {
-        Logger.log("Aviso leyendo drive_map.json previo: " + err.message);
-      }
-    }
-
-    if (!mapPayload.by_relative_path || typeof mapPayload.by_relative_path !== "object") {
-      mapPayload.by_relative_path = {};
-    }
-    if (!mapPayload.by_file_name || typeof mapPayload.by_file_name !== "object") {
-      mapPayload.by_file_name = {};
-    }
-
-    mapPayload.by_relative_path[rel] = fid;
-    mapPayload.by_file_name[safeFileName] = fid;
-    mapPayload.total_files = Object.keys(mapPayload.by_relative_path).length;
-    mapPayload.generated_at = new Date().toISOString();
-
-    const updatedJson = JSON.stringify(mapPayload);
-    if (mapFile) {
-      mapFile.setContent(updatedJson);
-    } else {
-      mapFile = rootFolder.createFile("drive_map.json", updatedJson, MimeType.PLAIN_TEXT);
-      if (COMPARTIR_SOLO_LECTURA_CON_ENLACE) {
-        try {
-          mapFile.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
-        } catch (err) {
-          Logger.log("Aviso compartiendo drive_map.json: " + err.message);
-        }
-      }
-    }
+    const mapState = _loadOrInitDriveMap(rootFolder, corpusFolder);
+    mapState.mapPayload.by_relative_path[rel] = fid;
+    mapState.mapPayload.by_file_name[safeFileName] = fid;
+    mapState.mapPayload.total_files = Object.keys(mapState.mapPayload.by_relative_path).length;
+    mapState.mapPayload.generated_at = new Date().toISOString();
+    const savedMapFile = _saveDriveMap(rootFolder, mapState);
 
     return _jsonResponse({
       ok: true,
+      action: "upload",
       file_id: fid,
       view_url: "https://drive.google.com/file/d/" + fid + "/view",
       relative_path: rel,
-      drive_map_file_id: mapFile.getId()
+      drive_map_file_id: savedMapFile.getId()
     });
   } catch (err) {
     return _jsonResponse({ ok: false, error: err && err.message ? err.message : String(err) });
@@ -232,7 +334,7 @@ function generarMapaDrive() {
   const byFileName = {};
   let total = 0;
 
-  // Recorrer subcarpetas dentro de corpus_pdf (01_Estatal_BOE_Codigos .. 08_Resolucions_Instrucions_Anuncios)
+  // Recorrer subcarpetas dentro de corpus_pdf (01_Estatal_BOE_Codigos .. 99_Historico_Derogadas)
   const catFolders = corpusFolder.getFolders();
   while (catFolders.hasNext()) {
     const cat = catFolders.next();

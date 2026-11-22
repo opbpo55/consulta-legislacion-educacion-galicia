@@ -353,6 +353,24 @@ class MotorConsultaEstricto:
         finally:
             conn.close()
 
+    @staticmethod
+    def _query_mentions_historical(query: str) -> bool:
+        qn = normalize_for_match(query)
+        if re.search(r"\b20(?:1\d|2[0-4])\b", qn) or re.search(r"\bcurso\s+202[0-4]\b", qn):
+            return True
+        return any(
+            k in qn
+            for k in (
+                "curso anterior",
+                "cursos anteriores",
+                "historic",
+                "derrogad",
+                "derogad",
+                "antigu",
+                "antiga",
+            )
+        )
+
     def _run_fts_search(
         self,
         conn: sqlite3.Connection,
@@ -361,11 +379,19 @@ class MotorConsultaEstricto:
         ambito: str = "",
         doc_type: str = "",
         limit: int = 60,
+        include_historical: bool = False,
     ) -> list[sqlite3.Row]:
         if not fts_query.strip():
             return []
         where = ["fragmentos_fts MATCH ?"]
         params: list[Any] = [fts_query]
+        if not include_historical:
+            where.append(
+                "(d.vigencia_status IS NULL OR ("
+                "LOWER(d.vigencia_status) NOT LIKE 'derrogad%' "
+                "AND LOWER(d.vigencia_status) NOT LIKE 'derogad%' "
+                "AND LOWER(d.vigencia_status) NOT LIKE 'superad%'))"
+            )
         if etapa:
             where.append("(d.etapas_json LIKE ? OR d.etapas_json LIKE '%\"Transversal\"%')")
             params.append(f'%"{etapa}"%')
@@ -394,6 +420,42 @@ class MotorConsultaEstricto:
             return conn.execute(sql, params + [limit]).fetchall()
         except sqlite3.OperationalError:
             return []
+
+    def _collect_fts_candidates(
+        self,
+        conn: sqlite3.Connection,
+        group_exprs: list[str],
+        effective_etapa: str,
+        etapa: str,
+        ambito: str,
+        doc_type: str,
+        include_historical: bool,
+    ) -> dict[str, sqlite3.Row]:
+        candidates_map: dict[str, sqlite3.Row] = {}
+        and_expr = " AND ".join(group_exprs[:4])
+        for row in self._run_fts_search(
+            conn, and_expr, effective_etapa, ambito, doc_type, limit=60, include_historical=include_historical
+        ):
+            candidates_map[row["chunk_id"]] = row
+
+        if len(candidates_map) < 5 and effective_etapa and not etapa:
+            for row in self._run_fts_search(
+                conn, and_expr, "", ambito, doc_type, limit=50, include_historical=include_historical
+            ):
+                candidates_map.setdefault(row["chunk_id"], row)
+
+        if len(candidates_map) < 6 and len(group_exprs) >= 2:
+            or_expr = " OR ".join(group_exprs[:7])
+            for row in self._run_fts_search(
+                conn, or_expr, effective_etapa, ambito, doc_type, limit=80, include_historical=include_historical
+            ):
+                candidates_map.setdefault(row["chunk_id"], row)
+            if len(candidates_map) < 6 and effective_etapa and not etapa:
+                for row in self._run_fts_search(
+                    conn, or_expr, "", ambito, doc_type, limit=60, include_historical=include_historical
+                ):
+                    candidates_map.setdefault(row["chunk_id"], row)
+        return candidates_map
 
     def _extract_best_sentences(
         self, chunk_text: str, concept_groups: list[list[str]], norm_refs: list[str]
@@ -471,6 +533,7 @@ class MotorConsultaEstricto:
         ambito: str = "",
         doc_type: str = "",
         top_k: int = 6,
+        include_historical: bool = False,
     ) -> dict[str, Any]:
         query = (query or "").strip()
         if not query:
@@ -488,24 +551,16 @@ class MotorConsultaEstricto:
         if not group_exprs:
             return self._abstain_response(query, "No se pudieron extraer términos de búsqueda válidos.")
 
+        eff_hist = include_historical or self._query_mentions_historical(query)
         conn = self._connect()
         try:
-            candidates_map: dict[str, sqlite3.Row] = {}
-            and_expr = " AND ".join(group_exprs[:4])
-            for row in self._run_fts_search(conn, and_expr, effective_etapa, ambito, doc_type, limit=60):
-                candidates_map[row["chunk_id"]] = row
-
-            if len(candidates_map) < 5 and effective_etapa and not etapa:
-                for row in self._run_fts_search(conn, and_expr, "", ambito, doc_type, limit=50):
-                    candidates_map.setdefault(row["chunk_id"], row)
-
-            if len(candidates_map) < 6 and len(group_exprs) >= 2:
-                or_expr = " OR ".join(group_exprs[:7])
-                for row in self._run_fts_search(conn, or_expr, effective_etapa, ambito, doc_type, limit=80):
-                    candidates_map.setdefault(row["chunk_id"], row)
-                if len(candidates_map) < 6 and effective_etapa and not etapa:
-                    for row in self._run_fts_search(conn, or_expr, "", ambito, doc_type, limit=60):
-                        candidates_map.setdefault(row["chunk_id"], row)
+            candidates_map = self._collect_fts_candidates(
+                conn, group_exprs, effective_etapa, etapa, ambito, doc_type, include_historical=eff_hist
+            )
+            if not candidates_map and not eff_hist:
+                candidates_map = self._collect_fts_candidates(
+                    conn, group_exprs, effective_etapa, etapa, ambito, doc_type, include_historical=True
+                )
 
             if not candidates_map:
                 return self._abstain_response(
@@ -589,10 +644,14 @@ class MotorConsultaEstricto:
                     score -= 1.2
 
                 pub = row["pub_date"] or ""
-                if pub >= "2024":
-                    score += 0.9
+                if pub >= "2026":
+                    score += 1.4
+                elif pub >= "2025":
+                    score += 1.1
+                elif pub >= "2024":
+                    score += 0.8
                 elif pub >= "2022":
-                    score += 0.6
+                    score += 0.5
 
                 ranked.append((score, combined_matches, row))
 

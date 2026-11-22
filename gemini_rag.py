@@ -753,7 +753,8 @@ class GeminiRAGEngine:
             "y mencionar explícitamente el nombre de la norma/archivo y el número de página PDF (ej.: 'según el Decreto 156/2022, pág. PDF 25 [[E1]]').\n"
             "3. Si existen normas autonómicas de Galicia y normas estatales, prioriza indicar claramente lo que establece Galicia y cita ambos documentos si se complementan.\n"
             "4. Si la normativa recuperada explica expresamente el criterio aplicable (por ejemplo, que no existe un número fijo de materias suspensas o remite a la decisión del equipo docente), RESPONDE explicando con exactitud lo que dice la norma con sus citas [[E#]] — NUNCA uses 'NO_CONSTA_EN_CORPUS:' en ese caso. Usa 'NO_CONSTA_EN_CORPUS: ' ÚNICAMENTE cuando los documentos no guarden relación o falte por completo la regulación preguntada.\n"
-            "5. Responde en el mismo idioma que la pregunta del usuario (español o gallego), de forma clara, estructurada con viñetas o apartados, y sin inventar jamás un número de artículo ni página."
+            "5. Responde en el mismo idioma que la pregunta del usuario (español o gallego), de forma clara, estructurada con viñetas o apartados, y sin inventar jamás un número de artículo ni página.\n"
+            "6. Si coexisten varias versiones anuales de instrucciones o calendarios escolares, prioriza siempre la del curso más reciente salvo que el usuario pregunte por un curso pasado, e indica el curso correspondiente."
         )
 
         user_prompt = (

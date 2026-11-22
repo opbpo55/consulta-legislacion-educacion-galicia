@@ -7,6 +7,10 @@ on:
   # Permite execución manual cun botón desde GitHub ("Run workflow")
   workflow_dispatch:
 
+concurrency:
+  group: actualizar-legislacion-galicia
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
@@ -45,8 +49,9 @@ jobs:
             echo "Detectáronse novos fragmentos da base de datos ou drive_map.json. Facendo commit..."
             git config --global user.name "github-actions[bot]"
             git config --global user.email "github-actions[bot]@users.noreply.github.com"
-            git add base_datos/ drive_map.json
+            git add -A base_datos/ drive_map.json
             git commit -m "Actualización automática lexislación [$(date +'%Y-%m-%d')]"
+            git pull --rebase origin main || true
             git push
             echo "Push completado. Render actualizará o servizo web automaticamente."
           else
