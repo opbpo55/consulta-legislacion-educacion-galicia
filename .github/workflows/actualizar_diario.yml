@@ -8,12 +8,12 @@ on:
   workflow_dispatch:
     inputs:
       filter_mode:
-        description: 'Modo de filtro (baleiro = usar variable FILTER_MODE ou opcion1 por defecto)'
+        description: 'Modo de filtro (automatico = usa variable FILTER_MODE ou opcion1 por defecto)'
         required: false
-        default: ''
+        default: 'automatico'
         type: choice
         options:
-          - ''
+          - automatico
           - opcion1
           - opcion2
 
@@ -50,7 +50,7 @@ jobs:
           NOTIFY_EMAIL: "oscar.perez.instituto@gmail.com"
           DRIVE_WEBHOOK_URL: ${{ secrets.DRIVE_WEBHOOK_URL }}
           DRIVE_WEBHOOK_TOKEN: ${{ secrets.DRIVE_WEBHOOK_TOKEN }}
-          FILTER_MODE: ${{ inputs.filter_mode || vars.FILTER_MODE || 'opcion1' }}
+          FILTER_MODE: ${{ inputs.filter_mode == 'opcion1' && 'opcion1' || inputs.filter_mode == 'opcion2' && 'opcion2' || vars.FILTER_MODE || 'opcion1' }}
         run: |
           python actualizador_diario.py
 
