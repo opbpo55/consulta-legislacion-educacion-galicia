@@ -343,6 +343,152 @@ def is_relevant_edu_option2(
     return False, "no_target_stage_signal"
 
 
+def get_filter_mode() -> str:
+    """Devuelve el modo activo: 'opcion1' (por defecto) o 'opcion2' según FILTER_MODE."""
+    raw = os.environ.get("FILTER_MODE", "opcion1").strip().lower()
+    if raw in ("opcion2", "2", "completa"):
+        return "opcion2"
+    return "opcion1"
+
+
+def is_relevant_edu(
+    title: str,
+    extra_text: str = "",
+    etapa_hint: str = "",
+    is_dog: bool = False,
+    mode: str | None = None,
+    from_normativa: bool = False,
+) -> tuple[bool, str]:
+    """
+    Aplica el interruptor configurable:
+      - opcion2: normativa + programas/convocatorias de ESO, Bachillerato y FP.
+      - opcion1 (por defecto): estrictamente legislación y normativa oficial de ESO, Bachillerato y FP.
+    """
+    ok2, reason2 = is_relevant_edu_option2(
+        title, extra_text=extra_text, etapa_hint=etapa_hint, is_dog=is_dog
+    )
+    if not ok2:
+        return False, reason2
+
+    raw_mode = (mode or get_filter_mode()).strip().lower()
+    eff_mode = "opcion2" if raw_mode in ("opcion2", "2", "completa") else "opcion1"
+    if eff_mode == "opcion2":
+        return True, reason2
+
+    t = _clean_space(f"{title} {extra_text}").lower()
+    non_normative_excl = (
+        "listaxe provisional",
+        "listaxe definitiva",
+        "relación provisional",
+        "relación definitiva",
+        "centros seleccionados",
+        "centros excluídos",
+        "proxectos seleccionados",
+        "equipos presentados",
+        "desafío",
+        "concurso",
+        "certame",
+        "premios extraordinarios",
+        "premios ",
+        "eduemprende",
+        "lanzadeiras",
+        "ciberfp",
+        "centros referentes",
+        "proxectos de inclusión educativa",
+        "(pie)",
+        "plan proxecta",
+        "polos creativos",
+        "clubes de lectura",
+        "club de lectura",
+        "olimpíada",
+        "olimpiada",
+        "campamento",
+        "xornadas ",
+        "baremo provisional",
+        "baremo definitivo",
+        "proxectos de formación",
+        "contrato-programa",
+        "contratos-programa",
+        "adxudicación definitiva de destinos",
+        "adxudicación provisional",
+    )
+    if any(k in t for k in non_normative_excl):
+        return False, "excluded_non_normative_option1"
+
+    normative_ranks = (
+        "lei ",
+        "ley ",
+        "real decreto",
+        "decreto ",
+        "orde do ",
+        "orde pola ",
+        "orden ",
+        "instrución",
+        "instrucción",
+        "circular",
+        "protocolo",
+        "corrección de erros",
+        "corrección de errores",
+        "acordo do consello",
+    )
+    core_reg_topics = (
+        "calendario escolar",
+        "currículo",
+        "curriculo",
+        "avaliación",
+        "evaluación",
+        "promoción",
+        "titulación",
+        "admisión",
+        "matrícula",
+        "ordenación",
+        "organización",
+        "funcionamento",
+        "comezo de curso",
+        "inicio de curso",
+        "inicio do curso",
+        "horario",
+        "horarios",
+        "convivencia",
+        "atención á diversidade",
+        "diversidade",
+        "orientación",
+        "fp dual",
+        "fct",
+        "formación en centros de traballo",
+        "probas libres",
+        "probas de acceso",
+        "pruebas de acceso",
+        "acreditación de competencias",
+        "convalidación",
+        "validación",
+        "abau",
+        "pau",
+        "acceso á universidade",
+        "acceso ás ensinanzas universitarias",
+        "plurilingü",
+        "transporte escolar",
+        "comedor escolar",
+        "libros de texto",
+        "centros docentes",
+        "inspección educativa",
+        "consello escolar",
+        "xade",
+    )
+
+    if (
+        from_normativa
+        or any(k in t for k in normative_ranks)
+        or (
+            "resolución" in t
+            and (any(k in t for k in core_reg_topics) or bool(re.search(r"\bneae\b", t)))
+        )
+    ):
+        return True, "matched_option1"
+
+    return False, "excluded_non_normative_option1"
+
+
 def build_attachment_title(base_title: str, link_label: str, pdf_url: str, total_links: int) -> str:
     base = _clean_space(base_title) or "Resolución Portal Educativo"
     if total_links <= 1:
@@ -521,7 +667,7 @@ def _collect_pdf_links_from_node(session: requests.Session, node_url: str, base_
     return final_title, pub_date, links
 
 
-def check_portal_normativa(session: requests.Session) -> list[dict]:
+def check_portal_normativa(session: requests.Session, filter_mode: str | None = None) -> list[dict]:
     """Rastrea normativa reciente filtrada por códigos oficiales tid_level de ESO, Bach y FP."""
     level_queries = [
         ("ESO", {"tid_level": "83"}),
@@ -564,7 +710,7 @@ def check_portal_normativa(session: requests.Session) -> list[dict]:
                 title = _clean_space(a.get_text(" ", strip=True))
                 d_el = row.select_one(".views-field-created")
                 pub_date = parse_date_iso(d_el.get_text(" ", strip=True)) if d_el else ""
-                ok_pre, _ = is_relevant_edu_option2(title, etapa_hint=etapa_label)
+                ok_pre, _ = is_relevant_edu(title, etapa_hint=etapa_label, mode=filter_mode, from_normativa=True)
                 if not ok_pre:
                     continue
                 entry = nodes.setdefault(node_url, {"title": title, "pub_date": pub_date, "etapas": set(), "hint": etapa_label})
@@ -579,7 +725,7 @@ def check_portal_normativa(session: requests.Session) -> list[dict]:
             pub_date = info["pub_date"] or node_date
             for lk in pdf_links:
                 doc_title = build_attachment_title(full_title, lk["label"], lk["url"], len(pdf_links))
-                ok, _ = is_relevant_edu_option2(doc_title, full_title, etapa_hint=info["hint"])
+                ok, _ = is_relevant_edu(doc_title, full_title, etapa_hint=info["hint"], mode=filter_mode, from_normativa=True)
                 if not ok:
                     continue
                 etapas = sorted(set(info["etapas"]) | set(infer_etapas(doc_title, info["hint"])))
@@ -598,7 +744,7 @@ def check_portal_normativa(session: requests.Session) -> list[dict]:
     return candidates
 
 
-def check_portal_anuncios(session: requests.Session) -> list[dict]:
+def check_portal_anuncios(session: requests.Session, filter_mode: str | None = None) -> list[dict]:
     """Rastrea anuncios y resoluciones recientes filtrados por tid_level de ESO, Bach y FP."""
     levels = [
         ("ESO", "83"),
@@ -638,7 +784,7 @@ def check_portal_anuncios(session: requests.Session) -> list[dict]:
                 title = _clean_space(a.get_text(" ", strip=True))
                 d_el = card.select_one(".views-field-created")
                 pub_date = parse_date_iso(d_el.get_text(" ", strip=True)) if d_el else ""
-                ok_pre, _ = is_relevant_edu_option2(title, etapa_hint=etapa_label)
+                ok_pre, _ = is_relevant_edu(title, etapa_hint=etapa_label, mode=filter_mode, from_normativa=False)
                 if not ok_pre:
                     continue
                 entry = nodes.setdefault(node_url, {"title": title, "pub_date": pub_date, "etapas": set(), "hint": etapa_label})
@@ -653,7 +799,7 @@ def check_portal_anuncios(session: requests.Session) -> list[dict]:
             pub_date = info["pub_date"] or node_date
             for lk in pdf_links:
                 doc_title = build_attachment_title(full_title, lk["label"], lk["url"], len(pdf_links))
-                ok, _ = is_relevant_edu_option2(doc_title, full_title, etapa_hint=info["hint"])
+                ok, _ = is_relevant_edu(doc_title, full_title, etapa_hint=info["hint"], mode=filter_mode, from_normativa=False)
                 if not ok:
                     continue
                 etapas = sorted(set(info["etapas"]) | set(infer_etapas(doc_title, info["hint"])))
@@ -672,7 +818,7 @@ def check_portal_anuncios(session: requests.Session) -> list[dict]:
     return candidates
 
 
-def check_fp_portal(session: requests.Session) -> list[dict]:
+def check_fp_portal(session: requests.Session, filter_mode: str | None = None) -> list[dict]:
     """Rastrea novedades y resoluciones recientes del Portal de Formación Profesional."""
     candidates: list[dict] = []
     novas_url = "https://www.edu.xunta.gal/fp/novas"
@@ -695,7 +841,7 @@ def check_fp_portal(session: requests.Session) -> list[dict]:
             full_title, node_date, pdf_links = _collect_pdf_links_from_node(session, node_url, title)
             for lk in pdf_links:
                 doc_title = build_attachment_title(full_title, lk["label"], lk["url"], len(pdf_links))
-                ok, _ = is_relevant_edu_option2(doc_title, full_title, etapa_hint="FP")
+                ok, _ = is_relevant_edu(doc_title, full_title, etapa_hint="FP", mode=filter_mode, from_normativa=False)
                 if not ok:
                     continue
                 etapas = sorted({"FP"} | set(infer_etapas(doc_title, "FP")))
@@ -714,8 +860,8 @@ def check_fp_portal(session: requests.Session) -> list[dict]:
     return candidates
 
 
-def check_dog_rss(session: requests.Session) -> list[dict]:
-    """Rastrea el RSS diario del DOG aplicando el filtro estricto Opción 2."""
+def check_dog_rss(session: requests.Session, filter_mode: str | None = None) -> list[dict]:
+    """Rastrea el RSS diario del DOG aplicando el filtro configurable (opcion1 / opcion2)."""
     candidates: list[dict] = []
     rss_url = "https://www.xunta.gal/diario-oficial-galicia/rss/"
     try:
@@ -729,7 +875,7 @@ def check_dog_rss(session: requests.Session) -> list[dict]:
                 pub_raw = _clean_space(it.pubDate.get_text(strip=True)) if it.pubDate else ""
                 if not link:
                     continue
-                ok, _ = is_relevant_edu_option2(title, desc, is_dog=True)
+                ok, _ = is_relevant_edu(title, desc, is_dog=True, mode=filter_mode, from_normativa=False)
                 if not ok:
                     continue
                 etapas = infer_etapas(f"{title} {desc}")
@@ -852,7 +998,7 @@ def index_new_document(conn: sqlite3.Connection, cand: dict, pdf_data: dict) -> 
             selectable_pages,
             is_selectable,
             json.dumps({"page_count": pdf_data["page_count"]}),
-            json.dumps({"auto_indexed": True, "date": today_str, "option": 2}),
+            json.dumps({"auto_indexed": True, "date": today_str, "filter_mode": get_filter_mode()}),
         ),
     )
 
@@ -1150,11 +1296,18 @@ def send_notification_email(
     updated_docs: list[dict],
     sources_checked: list[str],
     archived_docs: list[dict] | None = None,
+    filter_mode: str = "opcion1",
 ):
     """Envía un correo electrónico con los resultados de la comprobación."""
     smtp_user = os.environ.get("GMAIL_USER", RECIPIENT_EMAIL)
     smtp_pass = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
     archived = archived_docs or []
+    eff_mode = "opcion2" if (filter_mode or "").strip().lower() == "opcion2" else "opcion1"
+    mode_label = (
+        "Opción 2 (Lexislación + convocatorias/programas ESO/Bach/FP)"
+        if eff_mode == "opcion2"
+        else "Opción 1 (Solo lexislación e normativa ESO/Bach/FP)"
+    )
 
     today_str = datetime.now().strftime("%d/%m/%Y a las %H:%M")
 
@@ -1177,15 +1330,21 @@ def send_notification_email(
 
     if not updated_docs and not archived:
         msg["Subject"] = f"✅ Comprobación Legislativa Galicia: Sen novidades ({datetime.now().strftime('%d/%m/%Y')})"
+        none_detail = (
+            "Non se detectaron novas ordes, decretos, resolucións nin convocatorias de ESO, Bacharelato ou FP nas últimas 24 horas."
+            if eff_mode == "opcion2"
+            else "Non se detectaron novas leis, decretos, ordes, instrucións nin resolucións normativas de ESO, Bacharelato ou FP nas últimas 24 horas."
+        )
         body = f"""
         <html>
         <body style="font-family: Arial, sans-serif; color: #2d3748; line-height: 1.6;">
             <div style="background: #f7fafc; padding: 20px; border-radius: 8px; border: 1px solid #e2e8f0;">
                 <h2 style="color: #2b6cb0; margin-top: 0;">✅ Comprobación Diaria de Legislación Educativa</h2>
                 <p>Ola Óscar,</p>
-                <p>Realizouse con éxito a comprobación programada o <strong>{today_str}</strong> (filtro estrito ESO, Bacharelato e FP).</p>
+                <p>Realizouse con éxito a comprobación programada o <strong>{today_str}</strong>.</p>
+                <p style="margin-top: 0;"><strong>Modo activo:</strong> {mode_label}</p>
                 <div style="background: #ffffff; padding: 15px; border-radius: 6px; border-left: 4px solid #48bb78; margin: 15px 0;">
-                    <p style="margin: 0;"><strong>Resultado:</strong> Non se detectaron novas ordes, decretos, resolucións nin convocatorias de ESO, Bacharelato ou FP nas últimas 24 horas.</p>
+                    <p style="margin: 0;"><strong>Resultado:</strong> {none_detail}</p>
                 </div>
                 <p><strong>Fontes oficiais auditadas hoxe:</strong></p>
                 <ul>
@@ -1204,7 +1363,7 @@ def send_notification_email(
             <div style="background: #f7fafc; padding: 20px; border-radius: 8px; border: 1px solid #e2e8f0;">
                 <h2 style="color: #2b6cb0; margin-top: 0;">📁 Actualización de Vixencia (Sen documentos novos)</h2>
                 <p>Ola Óscar,</p>
-                <p>Realizouse a comprobación o <strong>{today_str}</strong> e actualizouse o estado de normas anteriores:</p>
+                <p>Realizouse a comprobación o <strong>{today_str}</strong> | <strong>Modo activo:</strong> {mode_label}.</p>
                 {archived_html}
                 <p>As normas anteriores consérvanse marcadas como históricas (non se borran) para manter sempre vixente a resposta do buscador.</p>
             </div>
@@ -1242,7 +1401,7 @@ def send_notification_email(
             <div style="background: #f7fafc; padding: 20px; border-radius: 8px; border: 1px solid #e2e8f0;">
                 <h2 style="color: #c53030; margin-top: 0;">🚨 Nova Publicación Normativa Detectada (ESO/Bach/FP)</h2>
                 <p>Ola Óscar,</p>
-                <p>O rastrexador automático detectou e indexou con éxito <strong>{len(updated_docs)} nova(s) disposición(óns)</strong> o {today_str}:</p>
+                <p>O rastrexador automático detectou e indexou con éxito <strong>{len(updated_docs)} nova(s) disposición(óns)</strong> o {today_str} | <strong>Modo activo:</strong> {mode_label}.</p>
                 <div style="background: #ffffff; padding: 15px; border-radius: 6px; border-left: 4px solid #e53e3e; margin: 15px 0;">
                     <ul style="padding-left: 20px; margin: 0;">
                         {doc_items_html}
@@ -1285,7 +1444,8 @@ def send_notification_email(
 
 
 def main():
-    print(f"=== INICIO COMPROBACIÓN DIARIA LEGISLACIÓN ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')}) ===")
+    filter_mode = get_filter_mode()
+    print(f"=== INICIO COMPROBACIÓN DIARIA LEGISLACIÓN ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')}) | MODO={filter_mode} ===")
     t0 = time.time()
     db_path = prepare_local_sqlite()
     conn = sqlite3.connect(str(db_path))
@@ -1300,16 +1460,16 @@ def main():
         "Portal Educativo da Xunta (/portal/normativa — ESO, Bacharelato, FP e Réxime xeral)",
         "Portal Educativo da Xunta (/portal/anuncios — ESO, Bacharelato, FP e Réxime xeral)",
         "Portal FP da Xunta (/fp/novas)",
-        "Diario Oficial de Galicia (DOG RSS con filtro Opción 2)",
+        f"Diario Oficial de Galicia (DOG RSS con filtro {filter_mode})",
         "Rexistro de normas derrogadas en Lex.gal",
     ]
 
-    print("[Crawler] Buscando novas publicacións en fontes oficiais (Opción 2: ESO, Bacharelato e FP)...")
+    print(f"[Crawler] Buscando novas publicacións en fontes oficiais (Modo activo: {filter_mode})...")
     raw_candidates: list[dict] = []
-    raw_candidates.extend(check_portal_normativa(session))
-    raw_candidates.extend(check_portal_anuncios(session))
-    raw_candidates.extend(check_fp_portal(session))
-    raw_candidates.extend(check_dog_rss(session))
+    raw_candidates.extend(check_portal_normativa(session, filter_mode=filter_mode))
+    raw_candidates.extend(check_portal_anuncios(session, filter_mode=filter_mode))
+    raw_candidates.extend(check_fp_portal(session, filter_mode=filter_mode))
+    raw_candidates.extend(check_dog_rss(session, filter_mode=filter_mode))
 
     # Deduplicar por source_url mantendo o primeiro título descritivo
     dedup_candidates: list[dict] = []
@@ -1320,7 +1480,7 @@ def main():
             seen_cand_urls.add(u)
             dedup_candidates.append(cand)
 
-    print(f"[Crawler] Evaluando {len(dedup_candidates)} publicacións recentes filtradas para ESO/Bach/FP...")
+    print(f"[Crawler] Evaluando {len(dedup_candidates)} publicacións recentes filtradas ({filter_mode})...")
     new_docs: list[dict] = []
     archived_docs: list[dict] = []
 
@@ -1393,7 +1553,7 @@ def main():
     else:
         print("[Update] Comprobación rematada: Ningunha normativa nova hoxe.")
 
-    send_notification_email(new_docs, sources_checked, archived_docs=archived_docs)
+    send_notification_email(new_docs, sources_checked, archived_docs=archived_docs, filter_mode=filter_mode)
 
     if db_path.exists():
         try:

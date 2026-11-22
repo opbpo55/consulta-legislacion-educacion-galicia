@@ -4,8 +4,18 @@ on:
   schedule:
     # Execútase todos os días ás 06:00 UTC (07:00 / 08:00 hora peninsular española)
     - cron: '0 6 * * *'
-  # Permite execución manual cun botón desde GitHub ("Run workflow")
+  # Permite execución manual cun botón desde GitHub ("Run workflow") e escoller o filtro
   workflow_dispatch:
+    inputs:
+      filter_mode:
+        description: 'Modo de filtro (baleiro = usar variable FILTER_MODE ou opcion1 por defecto)'
+        required: false
+        default: ''
+        type: choice
+        options:
+          - ''
+          - opcion1
+          - opcion2
 
 concurrency:
   group: actualizar-legislacion-galicia
@@ -40,6 +50,7 @@ jobs:
           NOTIFY_EMAIL: "oscar.perez.instituto@gmail.com"
           DRIVE_WEBHOOK_URL: ${{ secrets.DRIVE_WEBHOOK_URL }}
           DRIVE_WEBHOOK_TOKEN: ${{ secrets.DRIVE_WEBHOOK_TOKEN }}
+          FILTER_MODE: ${{ inputs.filter_mode || vars.FILTER_MODE || 'opcion1' }}
         run: |
           python actualizador_diario.py
 
